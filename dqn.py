@@ -114,7 +114,7 @@ def run_training_episode(
 
     solver = MiniSAT(cnf=loader.clauses)
     solver.step()
-    state = build_vcg_from_solver(solver, device)
+    next_state = state = build_vcg_from_solver(solver, device)
 
     episode_steps = 0
 

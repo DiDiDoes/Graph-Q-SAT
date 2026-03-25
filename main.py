@@ -2,8 +2,9 @@ import argparse
 import copy
 import random
 from pathlib import Path
-from tqdm import tqdm
 from typing import Tuple
+
+from tqdm import tqdm
 
 import torch
 from torch import nn
@@ -12,7 +13,7 @@ from minisat_wrapper import MiniSAT
 
 from buffer import ReplayBuffer
 from cnf import CNFLoader, build_vcg_from_solver
-from dataset import CNFDataset
+from dataset import CNFDataset, build_dataset, infer_dataset_source, parse_legacy_dataset_spec
 from dqn import DQNTrainConfig, epsilon_by_env_steps, run_training_episode, dqn_update
 from model import GraphQSat
 
@@ -24,8 +25,8 @@ def compute_median(values):
         return None
     if n % 2 == 1:
         return sorted_values[n // 2]
-    else:
-        return (sorted_values[n // 2 - 1] + sorted_values[n // 2]) / 2
+    return (sorted_values[n // 2 - 1] + sorted_values[n // 2]) / 2
+
 
 def compute_median_reduction(values, baselines):
     reductions = [b / v for v, b in zip(values, baselines)]
@@ -163,7 +164,7 @@ def train_model(
 
             if updates % cfg.eval_frequency == 0:
                 model.eval()
-                valid_decisions, valid_propagations, valid_median_decisions, valid_median_propagations = eval_model(valid_dataset, model, device)
+                _, _, valid_median_decisions, _ = eval_model(valid_dataset, model, device)
 
                 if valid_median_decisions < best_valid_score:
                     best_valid_score = valid_median_decisions
@@ -197,6 +198,25 @@ def sat_label(sat: bool) -> str:
     return "SAT" if sat else "UNSAT"
 
 
+def describe_dataset_spec(dataset_spec: str) -> str:
+    source = infer_dataset_source(dataset_spec)
+    if source == "legacy":
+        return f"legacy dataset {int(dataset_spec)}"
+    return f"mas_sat dataset {dataset_spec}"
+
+
+def validate_train_dataset_spec(dataset_spec: str) -> None:
+    num_variables = parse_legacy_dataset_spec(dataset_spec)
+    if num_variables is not None and num_variables != 50:
+        raise ValueError("Legacy training only supports '--dataset 50'. Use a mas_sat dataset id for other training datasets.")
+
+
+def validate_test_dataset_spec(dataset_spec: str) -> None:
+    num_variables = parse_legacy_dataset_spec(dataset_spec)
+    if num_variables is not None and num_variables not in {50, 100, 250}:
+        raise ValueError("Legacy testing only supports '--dataset 50', '--dataset 100', or '--dataset 250'.")
+
+
 def evaluate_and_report(dataset: CNFDataset, model: nn.Module, device: torch.device) -> None:
     solver_decisions, solver_propagations, solver_median_decisions, solver_median_propagations = eval_solver(dataset)
     model_decisions, model_propagations, model_median_decisions, model_median_propagations = eval_model(dataset, model, device)
@@ -212,16 +232,18 @@ def load_checkpoint(model: nn.Module, checkpoint_path: str, device: torch.device
 
 
 def run_train(args: argparse.Namespace) -> None:
+    validate_train_dataset_spec(args.dataset)
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = GraphQSat()
     model.eval()
     model.to(device)
 
-    print(f"Training on {sat_label(args.sat)} 50-variable instances with seed {args.seed}")
-    train_dataset = CNFDataset(num_variables=50, sat=args.sat, split="train")
-    valid_dataset = CNFDataset(num_variables=50, sat=args.sat, split="valid")
-    test_dataset = CNFDataset(num_variables=50, sat=args.sat, split="test")
+    dataset_description = describe_dataset_spec(args.dataset)
+    print(f"Training on {sat_label(args.sat)} {dataset_description} with seed {args.seed}")
+    train_dataset = build_dataset(args.dataset, sat=args.sat, split="train")
+    valid_dataset = build_dataset(args.dataset, sat=args.sat, split="valid")
+    test_dataset = build_dataset(args.dataset, sat=args.sat, split="test")
 
     train_model(train_dataset, valid_dataset, model, device)
     evaluate_and_report(test_dataset, model, device)
@@ -231,6 +253,7 @@ def run_train(args: argparse.Namespace) -> None:
 
 
 def run_test(args: argparse.Namespace) -> None:
+    validate_test_dataset_spec(args.dataset)
     set_seed(args.seed)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     checkpoint_path = Path(args.checkpoint_path)
@@ -242,12 +265,13 @@ def run_test(args: argparse.Namespace) -> None:
     load_checkpoint(model, str(checkpoint_path), device)
     model.eval()
 
+    dataset_description = describe_dataset_spec(args.dataset)
     print(
         f"Testing checkpoint {checkpoint_path} on "
-        f"{sat_label(args.sat)} {args.num_variables}-variable instances "
+        f"{sat_label(args.sat)} {dataset_description} "
         f"with seed {args.seed}"
     )
-    test_dataset = CNFDataset(num_variables=args.num_variables, sat=args.sat, split="test")
+    test_dataset = build_dataset(args.dataset, sat=args.sat, split="test")
     evaluate_and_report(test_dataset, model, device)
 
 
@@ -255,7 +279,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Train or evaluate Graph-Q-SAT.")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    train_parser = subparsers.add_parser("train", help="Train a model on 50-variable instances.")
+    dataset_help = (
+        "Dataset specification: use an integer like '50' for legacy datasets or "
+        "'<family>/<name>' like '3-sat/easy' for mas_sat datasets."
+    )
+
+    train_parser = subparsers.add_parser("train", help="Train a model on a legacy or mas_sat dataset.")
+    train_parser.add_argument(
+        "--dataset",
+        required=True,
+        help=dataset_help,
+    )
     train_parser.add_argument(
         "--sat",
         type=parse_bool_arg,
@@ -276,18 +310,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     train_parser.set_defaults(func=run_train)
 
-    test_parser = subparsers.add_parser("test", help="Evaluate a checkpoint on a test split.")
+    test_parser = subparsers.add_parser("test", help="Evaluate a checkpoint on a legacy or mas_sat test split.")
+    test_parser.add_argument(
+        "--dataset",
+        required=True,
+        help=dataset_help,
+    )
     test_parser.add_argument(
         "--checkpoint-path",
         required=True,
         help="Path to a saved model checkpoint.",
-    )
-    test_parser.add_argument(
-        "--num-variables",
-        type=int,
-        choices=[50, 100, 250],
-        required=True,
-        help="Variable count for the evaluation dataset.",
     )
     test_parser.add_argument(
         "--sat",
