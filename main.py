@@ -166,7 +166,8 @@ def train_model(
                 model.eval()
                 _, _, valid_median_decisions, _ = eval_model(valid_dataset, model, device)
 
-                if valid_median_decisions < best_valid_score:
+                if valid_median_decisions <= best_valid_score:
+                    # On tie, we keep the latest model
                     best_valid_score = valid_median_decisions
                     best_state_dict = copy.deepcopy(model.state_dict())
 
