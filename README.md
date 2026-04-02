@@ -28,3 +28,16 @@ Reproduction of Graph-Q-SAT [NeurIPS'20]
 | k-clique | 3.20x | 3.05x | 3.35x | 3.55x | 2.71x |
 | k-domset | 5.51x | 5.26x | 5.62x | 5.43x | 5.52x |
 | k-vercov | 4.43x | 4.78x | 4.46x | 5.29x | 4.65x |
+
+## Data Utilities
+
+`download_data.sh` downloads the legacy SATLIB datasets used by the original split.
+
+`copy_satlib_split.sh SOURCE_DIR DEST_DIR [DATASET_DIR ...]` copies those legacy CNF
+files into `DEST_DIR/DATASET_DIR/{train,valid,test}` using the same split as
+`dataset.py`: test `1-100`, validation `101-200`, and train `201-1000`. Output
+files are renamed within each split to zero-based `00000.cnf` format. During
+copy, trailing blank lines and trailing lines that are exactly `%` or `0` are
+removed.
+`uf250-*` and `uuf250-*` are handled separately because only the test files are
+present, so only `test/` is created for those datasets.
