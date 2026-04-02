@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from typing import List
 
 from torch_geometric.data import Data
 from torch_geometric.utils import scatter
@@ -249,6 +250,20 @@ class GraphQSat(nn.Module):
 
         return qs, var_mask
 
+    @staticmethod
+    def split_candidate_logits(data: Data, qs: torch.Tensor, var_mask: torch.Tensor) -> List[torch.Tensor]:
+        batch = getattr(data, "batch", None)
+        if batch is None:
+            return [qs[var_mask].flatten()]
+
+        num_graphs = int(batch.max().item()) + 1 if batch.numel() > 0 else 1
+        var_qs = qs[var_mask]
+        var_batch = batch[var_mask]
+        return [
+            var_qs[var_batch == graph_idx].flatten()
+            for graph_idx in range(num_graphs)
+        ]
+
     @torch.no_grad()
     def select_action(self, data: Data):
         """
@@ -258,8 +273,8 @@ class GraphQSat(nn.Module):
         The paper selects the argmax over all variable-node Q-values.
         """
         qs, var_mask = self.forward(data)
-        qs_var = qs[var_mask]
-        return qs_var.flatten().argmax(dim=-1).item()
+        candidate_logits = self.split_candidate_logits(data, qs, var_mask)[0]
+        return candidate_logits.argmax(dim=-1).item()
 
 
 # ---- Example usage ----

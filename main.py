@@ -15,7 +15,7 @@ from buffer import ReplayBuffer
 from cnf import CNFLoader, build_vcg_from_solver
 from dataset import CNFDataset, build_dataset, infer_dataset_source, parse_legacy_dataset_spec
 from dqn import DQNTrainConfig, build_dqn_config, epsilon_by_env_steps, run_training_episode, dqn_update
-from grpo import GRPOTrainConfig, build_grpo_config, collect_training_group, grpo_update
+from grpo import GRPOTrainConfig, build_grpo_config, collect_training_groups, grpo_update
 from model import GraphQSat
 from optim_config import OptimConfig
 
@@ -204,7 +204,7 @@ def train_grpo_model(
 
     while updates < cfg.batch_updates:
         model.eval()
-        episode_groups = []
+        cnf_batch = []
         batch_rewards = []
         total_steps = 0
 
@@ -216,15 +216,24 @@ def train_grpo_model(
             cnf_file = train_dataset[indices[next_train_idx]]
             next_train_idx += 1
 
-            episodes = collect_training_group(
-                cnf_file=cnf_file,
-                model=model,
-                device=device,
-                cfg=cfg,
-            )
-            episode_groups.append(episodes)
-            batch_rewards.extend(episode.reward for episode in episodes)
-            total_steps += sum(len(episode.steps) for episode in episodes)
+            cnf_batch.append(cnf_file)
+
+        episode_groups = collect_training_groups(
+            cnf_files=cnf_batch,
+            model=model,
+            device=device,
+            cfg=cfg,
+        )
+        batch_rewards.extend(
+            episode.reward
+            for episodes in episode_groups
+            for episode in episodes
+        )
+        total_steps += sum(
+            len(episode.steps)
+            for episodes in episode_groups
+            for episode in episodes
+        )
 
         model.train()
         loss = grpo_update(
@@ -482,6 +491,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=4,
         help="Number of policy-update epochs per rollout group when '--algorithm grpo' is selected.",
+    )
+    train_parser.add_argument(
+        "--grpo-inference-batch-graphs",
+        type=int,
+        default=0,
+        help="Maximum number of graphs per GRPO forward pass. Use 0 to batch all active graphs together.",
     )
     train_parser.set_defaults(func=run_train)
 
