@@ -1,3 +1,4 @@
+import argparse
 from dataclasses import dataclass
 import random
 from typing import Tuple
@@ -11,15 +12,14 @@ from minisat_wrapper import MiniSAT
 
 from buffer import ReplayBuffer
 from cnf import CNFLoader, build_vcg_from_solver
+from optim_config import OptimConfig, build_optim_config
 
 # ----------------------------
 # Hyperparameters from the paper
 # ----------------------------
 
 @dataclass(frozen=True)
-class DQNTrainConfig:
-    batch_updates: int = 50_000
-    lr: float = 2e-5
+class DQNTrainConfig(OptimConfig):
     batch_size: int = 64
     replay_size: int = 20_000
     eps_start: float = 1.0
@@ -29,11 +29,19 @@ class DQNTrainConfig:
     gamma: float = 0.99
     update_frequency: int = 4
     target_update_frequency: int = 10
-    max_decisions_train: int = 500
-    step_penalty: float = -0.1
-    truncate_penalty: float = -10.0
-    grad_clip_norm: float = 1.0
-    eval_frequency: int = 1_000
+
+
+def build_dqn_config(args: argparse.Namespace) -> DQNTrainConfig:
+    optim_cfg = build_optim_config(args)
+    return DQNTrainConfig(
+        batch_updates=optim_cfg.batch_updates,
+        lr=optim_cfg.lr,
+        max_decisions_train=optim_cfg.max_decisions_train,
+        step_penalty=optim_cfg.step_penalty,
+        truncate_penalty=optim_cfg.truncate_penalty,
+        grad_clip_norm=optim_cfg.grad_clip_norm,
+        eval_frequency=optim_cfg.eval_frequency,
+    )
 
 # ----------------------------
 # Action selection

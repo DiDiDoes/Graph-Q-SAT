@@ -14,8 +14,10 @@ from minisat_wrapper import MiniSAT
 from buffer import ReplayBuffer
 from cnf import CNFLoader, build_vcg_from_solver
 from dataset import CNFDataset, build_dataset, infer_dataset_source, parse_legacy_dataset_spec
-from dqn import DQNTrainConfig, epsilon_by_env_steps, run_training_episode, dqn_update
+from dqn import DQNTrainConfig, build_dqn_config, epsilon_by_env_steps, run_training_episode, dqn_update
+from grpo import GRPOTrainConfig, build_grpo_config, collect_training_group, grpo_update
 from model import GraphQSat
+from optim_config import OptimConfig
 
 
 def compute_median(values):
@@ -81,13 +83,13 @@ def eval_model(dataset: CNFDataset, model: nn.Module, device: torch.device) -> T
     return decisions, propagations, median_decisions, median_propagations
 
 
-def train_model(
+def train_dqn_model(
     train_dataset: CNFDataset,
     valid_dataset: CNFDataset,
     model: nn.Module,
     device: torch.device,
+    cfg: DQNTrainConfig,
 ):
-    cfg = DQNTrainConfig()
 
     model = model.to(device)
     target_model = copy.deepcopy(model).to(device)
@@ -176,6 +178,87 @@ def train_model(
     target_model.load_state_dict(best_state_dict)
 
 
+def train_grpo_model(
+    train_dataset: CNFDataset,
+    valid_dataset: CNFDataset,
+    model: nn.Module,
+    device: torch.device,
+    cfg: GRPOTrainConfig,
+) -> None:
+    model = model.to(device)
+    optimizer = torch.optim.Adam(
+        model.parameters(),
+        lr=cfg.lr,
+        betas=(0.9, 0.999),
+        eps=1e-8,
+    )
+
+    updates = 0
+    best_valid_score = float("inf")
+    best_state_dict = copy.deepcopy(model.state_dict())
+
+    progress = tqdm(total=cfg.batch_updates, desc="GRPO updates")
+    indices = list(range(len(train_dataset)))
+    random.shuffle(indices)
+    next_train_idx = 0
+
+    while updates < cfg.batch_updates:
+        model.eval()
+        episode_groups = []
+        batch_rewards = []
+        total_steps = 0
+
+        for _ in range(cfg.batch_size):
+            if next_train_idx >= len(indices):
+                random.shuffle(indices)
+                next_train_idx = 0
+
+            cnf_file = train_dataset[indices[next_train_idx]]
+            next_train_idx += 1
+
+            episodes = collect_training_group(
+                cnf_file=cnf_file,
+                model=model,
+                device=device,
+                cfg=cfg,
+            )
+            episode_groups.append(episodes)
+            batch_rewards.extend(episode.reward for episode in episodes)
+            total_steps += sum(len(episode.steps) for episode in episodes)
+
+        model.train()
+        loss = grpo_update(
+            model=model,
+            optimizer=optimizer,
+            episode_groups=episode_groups,
+            device=device,
+            cfg=cfg,
+        )
+        updates += 1
+        progress.update(1)
+
+        mean_reward = sum(batch_rewards) / len(batch_rewards)
+        postfix = {
+            "cnfs": cfg.batch_size,
+            "reward": f"{mean_reward:.1f}",
+            "steps": total_steps,
+        }
+        postfix["loss"] = "skip" if loss is None else f"{loss:.4f}"
+        progress.set_postfix(postfix)
+
+        if updates % cfg.eval_frequency == 0:
+            model.eval()
+            _, _, valid_median_decisions, _ = eval_model(valid_dataset, model, device)
+
+            if valid_median_decisions <= best_valid_score:
+                # On tie, we keep the latest model
+                best_valid_score = valid_median_decisions
+                best_state_dict = copy.deepcopy(model.state_dict())
+
+    progress.close()
+    model.load_state_dict(best_state_dict)
+
+
 def parse_bool_arg(value: str) -> bool:
     normalized = value.strip().lower()
     if normalized == "true":
@@ -241,12 +324,31 @@ def run_train(args: argparse.Namespace) -> None:
     model.to(device)
 
     dataset_description = describe_dataset_spec(args.dataset)
-    print(f"Training on {sat_label(args.sat)} {dataset_description} with seed {args.seed}")
+    print(
+        f"Training with {args.algorithm.upper()} on "
+        f"{sat_label(args.sat)} {dataset_description} "
+        f"with seed {args.seed}"
+    )
     train_dataset = build_dataset(args.dataset, sat=args.sat, split="train")
     valid_dataset = build_dataset(args.dataset, sat=args.sat, split="valid")
     test_dataset = build_dataset(args.dataset, sat=args.sat, split="test")
 
-    train_model(train_dataset, valid_dataset, model, device)
+    if args.algorithm == "dqn":
+        train_dqn_model(
+            train_dataset=train_dataset,
+            valid_dataset=valid_dataset,
+            model=model,
+            device=device,
+            cfg=build_dqn_config(args),
+        )
+    else:
+        train_grpo_model(
+            train_dataset=train_dataset,
+            valid_dataset=valid_dataset,
+            model=model,
+            device=device,
+            cfg=build_grpo_config(args),
+        )
     evaluate_and_report(test_dataset, model, device)
 
     torch.save(model.state_dict(), args.checkpoint_path)
@@ -308,6 +410,78 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=0,
         help="Random seed for reproducible training and evaluation.",
+    )
+    train_parser.add_argument(
+        "--algorithm",
+        choices=["dqn", "grpo"],
+        default="dqn",
+        help="Training algorithm to use. Evaluation remains algorithm-agnostic.",
+    )
+    train_parser.add_argument(
+        "--batch-updates",
+        type=int,
+        default=OptimConfig.batch_updates,
+        help="Number of training updates to run.",
+    )
+    train_parser.add_argument(
+        "--lr",
+        type=float,
+        default=OptimConfig.lr,
+        help="Learning rate for the selected training algorithm.",
+    )
+    train_parser.add_argument(
+        "--max-decisions-train",
+        type=int,
+        default=OptimConfig.max_decisions_train,
+        help="Maximum number of solver branching decisions allowed during a training rollout.",
+    )
+    train_parser.add_argument(
+        "--step-penalty",
+        type=float,
+        default=OptimConfig.step_penalty,
+        help="Per-step penalty used by DQN rollouts and carried in the shared optimization config.",
+    )
+    train_parser.add_argument(
+        "--truncate-penalty",
+        type=float,
+        default=OptimConfig.truncate_penalty,
+        help="Penalty applied when a training rollout hits the max-decision cap.",
+    )
+    train_parser.add_argument(
+        "--grad-clip-norm",
+        type=float,
+        default=OptimConfig.grad_clip_norm,
+        help="Gradient clipping norm used during training updates.",
+    )
+    train_parser.add_argument(
+        "--eval-frequency",
+        type=int,
+        default=OptimConfig.eval_frequency,
+        help="Run validation every N training updates.",
+    )
+    train_parser.add_argument(
+        "--grpo-batch-size",
+        type=int,
+        default=1,
+        help="Number of distinct CNFs collected per GRPO update batch.",
+    )
+    train_parser.add_argument(
+        "--grpo-group-size",
+        type=int,
+        default=4,
+        help="Number of rollout episodes collected per CNF when '--algorithm grpo' is selected.",
+    )
+    train_parser.add_argument(
+        "--grpo-clip-eps",
+        type=float,
+        default=0.2,
+        help="PPO-style clipping epsilon used when '--algorithm grpo' is selected.",
+    )
+    train_parser.add_argument(
+        "--grpo-epochs",
+        type=int,
+        default=4,
+        help="Number of policy-update epochs per rollout group when '--algorithm grpo' is selected.",
     )
     train_parser.set_defaults(func=run_train)
 

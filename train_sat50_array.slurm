@@ -4,14 +4,24 @@
 #SBATCH --mem=32G
 #SBATCH --gpus=mi210:1
 #SBATCH -p batch
-#SBATCH --array=1-5
+#SBATCH --array=1-10
 #SBATCH --output=logs/graphqsat-train-sat50-%A_%a.out
 #SBATCH --error=/scratch/%u/graphqsat-train-sat50-%A_%a.err
 
-SEED=$((SLURM_ARRAY_TASK_ID - 1))
+NUM_SEEDS=5
+TASK_ID=$((SLURM_ARRAY_TASK_ID - 1))
+
+if (( TASK_ID < NUM_SEEDS )); then
+  ALGORITHM="dqn"
+  SEED=${TASK_ID}
+else
+  ALGORITHM="grpo"
+  SEED=$((TASK_ID - NUM_SEEDS))
+fi
 
 python main.py train \
+  --algorithm "${ALGORITHM}" \
   --dataset 50 \
   --sat true \
-  --seed $SEED \
-  --checkpoint-path checkpoints/graphqsat_sat50_seed${SEED}.pth
+  --seed "${SEED}" \
+  --checkpoint-path "checkpoints/graphqsat_${ALGORITHM}_sat50_seed${SEED}.pth"
