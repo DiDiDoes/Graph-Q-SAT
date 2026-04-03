@@ -15,7 +15,14 @@ from buffer import ReplayBuffer
 from cnf import CNFLoader, build_vcg_from_solver
 from dataset import CNFDataset, build_dataset, infer_dataset_source, parse_legacy_dataset_spec
 from dqn import DQNTrainConfig, build_dqn_config, epsilon_by_env_steps, run_training_episode, dqn_update
-from grpo import GRPOTrainConfig, build_grpo_config, collect_training_groups, grpo_update
+from grpo import (
+    GRPOTrainConfig,
+    build_grpo_config,
+    collect_training_groups,
+    grpo_update,
+    grpo_update_steps,
+    prepare_grpo_training_steps,
+)
 from model import GraphQSat
 from optim_config import OptimConfig
 
@@ -238,54 +245,118 @@ def train_grpo_model(
             device=device,
             cfg=cfg,
         )
-        random.shuffle(episode_groups)
-
-        for start in range(0, len(episode_groups), cfg.batch_size):
-            if updates >= cfg.batch_updates:
-                break
-
-            minibatch_groups = episode_groups[start:start + cfg.batch_size]
-            batch_rewards = [
-                episode.reward
-                for episodes in minibatch_groups
-                for episode in episodes
-            ]
-            total_steps = sum(
-                len(episode.steps)
-                for episodes in minibatch_groups
-                for episode in episodes
-            )
-
-            model.train()
-            loss = grpo_update(
-                model=model,
-                optimizer=optimizer,
-                episode_groups=minibatch_groups,
+        if cfg.step_batch_size > 0:
+            training_steps = prepare_grpo_training_steps(
+                episode_groups=episode_groups,
                 device=device,
                 cfg=cfg,
             )
-            updates += 1
-            progress.update(1)
+            all_episode_rewards = [
+                episode.reward
+                for episodes in episode_groups
+                for episode in episodes
+            ]
+            random.shuffle(training_steps)
 
-            mean_reward = sum(batch_rewards) / len(batch_rewards)
-            postfix = {
-                "reward": f"{mean_reward:.1f}",
-                "steps": total_steps,
-            }
-            # postfix["loss"] = "skip" if loss is None else f"{loss:.4f}"
-            gpu_memory = format_cuda_memory(device)
-            if gpu_memory is not None:
-                postfix["gpu"] = gpu_memory
-            progress.set_postfix(postfix)
+            step_batches = [
+                training_steps[start:start + cfg.step_batch_size]
+                for start in range(0, len(training_steps), cfg.step_batch_size)
+            ]
+            if not step_batches:
+                step_batches = [[]]
 
-            if updates % cfg.eval_frequency == 0:
-                model.eval()
-                _, _, valid_median_decisions, _ = eval_model(valid_dataset, model, device)
+            for minibatch_steps in step_batches:
+                if updates >= cfg.batch_updates:
+                    break
 
-                if valid_median_decisions <= best_valid_score:
-                    # On tie, we keep the latest model
-                    best_valid_score = valid_median_decisions
-                    best_state_dict = copy.deepcopy(model.state_dict())
+                if minibatch_steps:
+                    batch_episode_rewards = {}
+                    for step in minibatch_steps:
+                        batch_episode_rewards[step.episode_id] = step.episode_reward
+                    batch_rewards = list(batch_episode_rewards.values())
+                else:
+                    batch_rewards = all_episode_rewards
+                total_steps = len(minibatch_steps)
+
+                model.train()
+                loss = grpo_update_steps(
+                    model=model,
+                    optimizer=optimizer,
+                    training_steps=minibatch_steps,
+                    device=device,
+                    cfg=cfg,
+                )
+                updates += 1
+                progress.update(1)
+
+                mean_reward = sum(batch_rewards) / len(batch_rewards)
+                postfix = {
+                    "reward": f"{mean_reward:.1f}",
+                    "steps": total_steps,
+                }
+                # postfix["loss"] = "skip" if loss is None else f"{loss:.4f}"
+                gpu_memory = format_cuda_memory(device)
+                if gpu_memory is not None:
+                    postfix["gpu"] = gpu_memory
+                progress.set_postfix(postfix)
+
+                if updates % cfg.eval_frequency == 0:
+                    model.eval()
+                    _, _, valid_median_decisions, _ = eval_model(valid_dataset, model, device)
+
+                    if valid_median_decisions <= best_valid_score:
+                        # On tie, we keep the latest model
+                        best_valid_score = valid_median_decisions
+                        best_state_dict = copy.deepcopy(model.state_dict())
+        else:
+            random.shuffle(episode_groups)
+
+            for start in range(0, len(episode_groups), cfg.batch_size):
+                if updates >= cfg.batch_updates:
+                    break
+
+                minibatch_groups = episode_groups[start:start + cfg.batch_size]
+                batch_rewards = [
+                    episode.reward
+                    for episodes in minibatch_groups
+                    for episode in episodes
+                ]
+                total_steps = sum(
+                    len(episode.steps)
+                    for episodes in minibatch_groups
+                    for episode in episodes
+                )
+
+                model.train()
+                loss = grpo_update(
+                    model=model,
+                    optimizer=optimizer,
+                    episode_groups=minibatch_groups,
+                    device=device,
+                    cfg=cfg,
+                )
+                updates += 1
+                progress.update(1)
+
+                mean_reward = sum(batch_rewards) / len(batch_rewards)
+                postfix = {
+                    "reward": f"{mean_reward:.1f}",
+                    "steps": total_steps,
+                }
+                # postfix["loss"] = "skip" if loss is None else f"{loss:.4f}"
+                gpu_memory = format_cuda_memory(device)
+                if gpu_memory is not None:
+                    postfix["gpu"] = gpu_memory
+                progress.set_postfix(postfix)
+
+                if updates % cfg.eval_frequency == 0:
+                    model.eval()
+                    _, _, valid_median_decisions, _ = eval_model(valid_dataset, model, device)
+
+                    if valid_median_decisions <= best_valid_score:
+                        # On tie, we keep the latest model
+                        best_valid_score = valid_median_decisions
+                        best_state_dict = copy.deepcopy(model.state_dict())
 
     progress.close()
     model.load_state_dict(best_state_dict)
@@ -496,6 +567,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=1,
         help="Number of distinct CNFs used per GRPO optimizer update batch.",
+    )
+    train_parser.add_argument(
+        "--grpo-step-batch-size",
+        type=int,
+        default=0,
+        help="Number of rollout steps used per GRPO optimizer update batch. Positive values override '--grpo-batch-size'.",
     )
     train_parser.add_argument(
         "--grpo-buffer-size",

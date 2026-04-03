@@ -16,6 +16,7 @@ from optim_config import OptimConfig, build_optim_config
 @dataclass(frozen=True)
 class GRPOTrainConfig(OptimConfig):
     batch_size: int = 1
+    step_batch_size: int = 0
     buffer_size: int = 1
     group_size: int = 4
     clip_eps: float = 0.2
@@ -28,12 +29,14 @@ class GRPOTrainConfig(OptimConfig):
 def build_grpo_config(args: argparse.Namespace) -> GRPOTrainConfig:
     if args.grpo_batch_size < 1:
         raise ValueError("--grpo-batch-size must be at least 1.")
+    if args.grpo_step_batch_size < 0:
+        raise ValueError("--grpo-step-batch-size must be non-negative.")
     buffer_size = args.grpo_buffer_size if args.grpo_buffer_size is not None else args.grpo_batch_size
     if buffer_size < 1:
         raise ValueError("--grpo-buffer-size must be at least 1.")
-    if buffer_size < args.grpo_batch_size:
+    if args.grpo_step_batch_size == 0 and buffer_size < args.grpo_batch_size:
         raise ValueError("--grpo-buffer-size must be greater than or equal to --grpo-batch-size.")
-    if buffer_size % args.grpo_batch_size != 0:
+    if args.grpo_step_batch_size == 0 and buffer_size % args.grpo_batch_size != 0:
         raise ValueError("--grpo-buffer-size must be divisible by --grpo-batch-size.")
     if args.grpo_group_size < 2:
         raise ValueError("--grpo-group-size must be at least 2.")
@@ -54,6 +57,7 @@ def build_grpo_config(args: argparse.Namespace) -> GRPOTrainConfig:
         grad_clip_norm=optim_cfg.grad_clip_norm,
         eval_frequency=optim_cfg.eval_frequency,
         batch_size=args.grpo_batch_size,
+        step_batch_size=args.grpo_step_batch_size,
         buffer_size=buffer_size,
         group_size=args.grpo_group_size,
         clip_eps=args.grpo_clip_eps,
@@ -74,6 +78,16 @@ class GRPOEpisode:
     steps: List[GRPOStep]
     reward: float
     terminal_state: int
+
+
+@dataclass
+class GRPOTrainingStep:
+    state: Data
+    action: int
+    old_log_prob: float
+    advantage: float
+    episode_id: int
+    episode_reward: float
 
 
 @dataclass
@@ -212,37 +226,56 @@ def collect_training_groups(
     ]
 
 
-def grpo_update(
-    model: GraphQSat,
-    optimizer: torch.optim.Optimizer,
+def prepare_grpo_training_steps(
     episode_groups: List[List[GRPOEpisode]],
     device: torch.device,
     cfg: GRPOTrainConfig,
-) -> Optional[float]:
-    states = []
-    actions = []
-    old_log_probs = []
-    advantages = []
+) -> List[GRPOTrainingStep]:
+    training_steps = []
+    episode_id = 0
 
     for episodes in episode_groups:
         rewards = torch.tensor([episode.reward for episode in episodes], dtype=torch.float, device=device)
         if rewards.numel() == 0 or torch.allclose(rewards, rewards[0]):
+            episode_id += len(episodes)
             continue
 
         group_advantages = (rewards - rewards.mean()) / (rewards.std(unbiased=False) + cfg.advantage_eps)
         for episode, advantage in zip(episodes, group_advantages):
             for step in episode.steps:
-                states.append(step.state)
-                actions.append(step.action)
-                old_log_probs.append(step.old_log_prob)
-                advantages.append(float(advantage.item()))
+                training_steps.append(
+                    GRPOTrainingStep(
+                        state=step.state,
+                        action=step.action,
+                        old_log_prob=step.old_log_prob,
+                        advantage=float(advantage.item()),
+                        episode_id=episode_id,
+                        episode_reward=episode.reward,
+                    )
+                )
+            episode_id += 1
 
-    if not states:
+    return training_steps
+
+
+def grpo_update_steps(
+    model: GraphQSat,
+    optimizer: torch.optim.Optimizer,
+    training_steps: List[GRPOTrainingStep],
+    device: torch.device,
+    cfg: GRPOTrainConfig,
+) -> Optional[float]:
+    if not training_steps:
         return None
 
-    actions_tensor = torch.tensor(actions, dtype=torch.long, device=device)
-    old_log_probs_tensor = torch.tensor(old_log_probs, dtype=torch.float, device=device)
-    advantages_tensor = torch.tensor(advantages, dtype=torch.float, device=device)
+    states = [step.state for step in training_steps]
+    actions_tensor = torch.tensor([step.action for step in training_steps], dtype=torch.long, device=device)
+    old_log_probs_tensor = torch.tensor(
+        [step.old_log_prob for step in training_steps],
+        dtype=torch.float,
+        device=device,
+    )
+    advantages_tensor = torch.tensor([step.advantage for step in training_steps], dtype=torch.float, device=device)
 
     last_loss = None
     for _ in range(cfg.ppo_epochs):
@@ -279,3 +312,24 @@ def grpo_update(
         last_loss = float(loss.item())
 
     return last_loss
+
+
+def grpo_update(
+    model: GraphQSat,
+    optimizer: torch.optim.Optimizer,
+    episode_groups: List[List[GRPOEpisode]],
+    device: torch.device,
+    cfg: GRPOTrainConfig,
+) -> Optional[float]:
+    training_steps = prepare_grpo_training_steps(
+        episode_groups=episode_groups,
+        device=device,
+        cfg=cfg,
+    )
+    return grpo_update_steps(
+        model=model,
+        optimizer=optimizer,
+        training_steps=training_steps,
+        device=device,
+        cfg=cfg,
+    )
