@@ -35,6 +35,18 @@ def compute_median_reduction(values, baselines):
     return compute_median(reductions)
 
 
+def format_cuda_memory(device: torch.device) -> str | None:
+    if device.type != "cuda" or not torch.cuda.is_available():
+        return None
+
+    device_index = device.index if device.index is not None else torch.cuda.current_device()
+    gib = 1024 ** 3
+    allocated = torch.cuda.memory_allocated(device_index) / gib
+    reserved = torch.cuda.memory_reserved(device_index) / gib
+    peak = torch.cuda.max_memory_allocated(device_index) / gib
+    return f"{allocated:.1f}/{reserved:.1f}/{peak:.1f}G"
+
+
 def eval_solver(dataset: CNFDataset) -> Tuple[list, list, float, float]:
     decisions = []
     propagations = []
@@ -186,6 +198,10 @@ def train_grpo_model(
     cfg: GRPOTrainConfig,
 ) -> None:
     model = model.to(device)
+    if device.type == "cuda" and torch.cuda.is_available():
+        device_index = device.index if device.index is not None else torch.cuda.current_device()
+        torch.cuda.reset_peak_memory_stats(device_index)
+
     optimizer = torch.optim.Adam(
         model.parameters(),
         lr=cfg.lr,
@@ -204,11 +220,9 @@ def train_grpo_model(
 
     while updates < cfg.batch_updates:
         model.eval()
-        cnf_batch = []
-        batch_rewards = []
-        total_steps = 0
+        cnf_buffer = []
 
-        for _ in range(cfg.batch_size):
+        for _ in range(cfg.buffer_size):
             if next_train_idx >= len(indices):
                 random.shuffle(indices)
                 next_train_idx = 0
@@ -216,53 +230,62 @@ def train_grpo_model(
             cnf_file = train_dataset[indices[next_train_idx]]
             next_train_idx += 1
 
-            cnf_batch.append(cnf_file)
+            cnf_buffer.append(cnf_file)
 
         episode_groups = collect_training_groups(
-            cnf_files=cnf_batch,
+            cnf_files=cnf_buffer,
             model=model,
             device=device,
             cfg=cfg,
         )
-        batch_rewards.extend(
-            episode.reward
-            for episodes in episode_groups
-            for episode in episodes
-        )
-        total_steps += sum(
-            len(episode.steps)
-            for episodes in episode_groups
-            for episode in episodes
-        )
+        random.shuffle(episode_groups)
 
-        model.train()
-        loss = grpo_update(
-            model=model,
-            optimizer=optimizer,
-            episode_groups=episode_groups,
-            device=device,
-            cfg=cfg,
-        )
-        updates += 1
-        progress.update(1)
+        for start in range(0, len(episode_groups), cfg.batch_size):
+            if updates >= cfg.batch_updates:
+                break
 
-        mean_reward = sum(batch_rewards) / len(batch_rewards)
-        postfix = {
-            "cnfs": cfg.batch_size,
-            "reward": f"{mean_reward:.1f}",
-            "steps": total_steps,
-        }
-        postfix["loss"] = "skip" if loss is None else f"{loss:.4f}"
-        progress.set_postfix(postfix)
+            minibatch_groups = episode_groups[start:start + cfg.batch_size]
+            batch_rewards = [
+                episode.reward
+                for episodes in minibatch_groups
+                for episode in episodes
+            ]
+            total_steps = sum(
+                len(episode.steps)
+                for episodes in minibatch_groups
+                for episode in episodes
+            )
 
-        if updates % cfg.eval_frequency == 0:
-            model.eval()
-            _, _, valid_median_decisions, _ = eval_model(valid_dataset, model, device)
+            model.train()
+            loss = grpo_update(
+                model=model,
+                optimizer=optimizer,
+                episode_groups=minibatch_groups,
+                device=device,
+                cfg=cfg,
+            )
+            updates += 1
+            progress.update(1)
 
-            if valid_median_decisions <= best_valid_score:
-                # On tie, we keep the latest model
-                best_valid_score = valid_median_decisions
-                best_state_dict = copy.deepcopy(model.state_dict())
+            mean_reward = sum(batch_rewards) / len(batch_rewards)
+            postfix = {
+                "reward": f"{mean_reward:.1f}",
+                "steps": total_steps,
+            }
+            # postfix["loss"] = "skip" if loss is None else f"{loss:.4f}"
+            gpu_memory = format_cuda_memory(device)
+            if gpu_memory is not None:
+                postfix["gpu"] = gpu_memory
+            progress.set_postfix(postfix)
+
+            if updates % cfg.eval_frequency == 0:
+                model.eval()
+                _, _, valid_median_decisions, _ = eval_model(valid_dataset, model, device)
+
+                if valid_median_decisions <= best_valid_score:
+                    # On tie, we keep the latest model
+                    best_valid_score = valid_median_decisions
+                    best_state_dict = copy.deepcopy(model.state_dict())
 
     progress.close()
     model.load_state_dict(best_state_dict)
@@ -472,7 +495,13 @@ def build_parser() -> argparse.ArgumentParser:
         "--grpo-batch-size",
         type=int,
         default=1,
-        help="Number of distinct CNFs collected per GRPO update batch.",
+        help="Number of distinct CNFs used per GRPO optimizer update batch.",
+    )
+    train_parser.add_argument(
+        "--grpo-buffer-size",
+        type=int,
+        default=None,
+        help="Number of distinct CNFs rolled out before GRPO optimization. Defaults to '--grpo-batch-size'.",
     )
     train_parser.add_argument(
         "--grpo-group-size",

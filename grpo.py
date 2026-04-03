@@ -16,6 +16,7 @@ from optim_config import OptimConfig, build_optim_config
 @dataclass(frozen=True)
 class GRPOTrainConfig(OptimConfig):
     batch_size: int = 1
+    buffer_size: int = 1
     group_size: int = 4
     clip_eps: float = 0.2
     ppo_epochs: int = 4
@@ -27,6 +28,13 @@ class GRPOTrainConfig(OptimConfig):
 def build_grpo_config(args: argparse.Namespace) -> GRPOTrainConfig:
     if args.grpo_batch_size < 1:
         raise ValueError("--grpo-batch-size must be at least 1.")
+    buffer_size = args.grpo_buffer_size if args.grpo_buffer_size is not None else args.grpo_batch_size
+    if buffer_size < 1:
+        raise ValueError("--grpo-buffer-size must be at least 1.")
+    if buffer_size < args.grpo_batch_size:
+        raise ValueError("--grpo-buffer-size must be greater than or equal to --grpo-batch-size.")
+    if buffer_size % args.grpo_batch_size != 0:
+        raise ValueError("--grpo-buffer-size must be divisible by --grpo-batch-size.")
     if args.grpo_group_size < 2:
         raise ValueError("--grpo-group-size must be at least 2.")
     if args.grpo_clip_eps < 0:
@@ -46,6 +54,7 @@ def build_grpo_config(args: argparse.Namespace) -> GRPOTrainConfig:
         grad_clip_norm=optim_cfg.grad_clip_norm,
         eval_frequency=optim_cfg.eval_frequency,
         batch_size=args.grpo_batch_size,
+        buffer_size=buffer_size,
         group_size=args.grpo_group_size,
         clip_eps=args.grpo_clip_eps,
         ppo_epochs=args.grpo_epochs,
