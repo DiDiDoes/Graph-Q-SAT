@@ -1,10 +1,11 @@
 import argparse
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 import torch
 from torch.distributions import Categorical
 from torch_geometric.data import Batch, Data
+from torch_geometric.utils import scatter
 
 from minisat_wrapper import MiniSAT
 
@@ -113,26 +114,19 @@ def batched_candidate_logits(
     return model.split_candidate_logits(batch, qs, var_mask)
 
 
-def chunked_candidate_logits(
+def batched_packed_candidate_logits(
     model: GraphQSat,
     states: List[Data],
     device: torch.device,
-    max_graphs: int,
-) -> List[torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor]:
     if not states:
-        return []
+        empty_long = torch.empty(0, dtype=torch.long, device=device)
+        empty_float = torch.empty(0, dtype=torch.float, device=device)
+        return empty_float, empty_long
 
-    chunk_size = max_graphs if max_graphs > 0 else len(states)
-    logits = []
-    for start in range(0, len(states), chunk_size):
-        logits.extend(
-            batched_candidate_logits(
-                model=model,
-                states=states[start:start + chunk_size],
-                device=device,
-            )
-        )
-    return logits
+    batch = Batch.from_data_list(states).to(device)
+    qs, var_mask = model(batch)
+    return model.pack_candidate_logits(batch, qs, var_mask)
 
 
 @torch.no_grad()
@@ -160,7 +154,7 @@ def collect_training_groups(
                 terminal_state=solver.state,
             )
             if solver.state == 0:
-                rollout.state = build_vcg_from_solver(solver, device)
+                rollout.state = build_vcg_from_solver(solver)
                 active_rollouts.append(rollout)
             elif solver.state in [10, 20]:
                 rollout.reward = -float(solver.decisions)
@@ -171,49 +165,93 @@ def collect_training_groups(
         episode_groups.append(group_rollouts)
 
     while active_rollouts:
-        active_states = [rollout.state for rollout in active_rollouts if rollout.state is not None]
-        active_logits = chunked_candidate_logits(
-            model=model,
-            states=active_states,
-            device=device,
-            max_graphs=cfg.inference_batch_graphs,
-        )
-
         next_active_rollouts = []
-        for rollout, logits in zip(active_rollouts, active_logits):
-            if rollout.state is None:
-                continue
-
-            action_dist = Categorical(logits=logits)
-            action_tensor = action_dist.sample()
-            action = int(action_tensor.item())
-            rollout.steps.append(
-                GRPOStep(
-                    state=rollout.state,
-                    action=action,
-                    old_log_prob=float(action_dist.log_prob(action_tensor).item()),
-                )
+        chunk_size = cfg.inference_batch_graphs if cfg.inference_batch_graphs > 0 else len(active_rollouts)
+        for start in range(0, len(active_rollouts), chunk_size):
+            chunk_rollouts = active_rollouts[start:start + chunk_size]
+            chunk_states = [rollout.state for rollout in chunk_rollouts if rollout.state is not None]
+            candidate_logits, candidate_ptr = batched_packed_candidate_logits(
+                model=model,
+                states=chunk_states,
+                device=device,
             )
 
-            rollout.solver.step(rollout.solver.candidates[action])
-            rollout.episode_steps += 1
-            rollout.terminal_state = rollout.solver.state
+            candidate_counts = candidate_ptr[1:] - candidate_ptr[:-1]
+            num_graphs = int(candidate_counts.numel())
+            if torch.any(candidate_counts <= 0):
+                raise ValueError("Encountered an active GRPO rollout with no candidate actions.")
 
-            if rollout.solver.state in [10, 20]:
-                rollout.reward = -float(rollout.solver.decisions)
-                rollout.state = None
-            elif rollout.episode_steps >= cfg.max_decisions_train:
-                rollout.reward = cfg.truncate_penalty
-                rollout.state = None
-            elif rollout.solver.state == 0:
-                rollout.state = build_vcg_from_solver(rollout.solver, device)
-                next_active_rollouts.append(rollout)
-            else:
-                raise ValueError(f"Unexpected solver state: {rollout.solver.state}")
+            candidate_batch = torch.repeat_interleave(
+                torch.arange(num_graphs, device=device),
+                candidate_counts,
+            )
+            max_logits = scatter(candidate_logits, candidate_batch, dim=0, dim_size=num_graphs, reduce="max")
+            exp_logits = torch.exp(candidate_logits - max_logits[candidate_batch])
+            sum_exp_logits = scatter(exp_logits, candidate_batch, dim=0, dim_size=num_graphs, reduce="sum")
+            probs = exp_logits / sum_exp_logits[candidate_batch]
+            cumulative_probs = torch.cumsum(probs, dim=0)
+            cumulative_offsets = torch.zeros(num_graphs, dtype=probs.dtype, device=device)
+            last_candidate_indices = candidate_ptr[1:] - 1
+            if num_graphs > 1:
+                cumulative_offsets[1:] = cumulative_probs[last_candidate_indices[:-1]]
+            relative_cumulative_probs = cumulative_probs - cumulative_offsets[candidate_batch]
+            relative_cumulative_probs[last_candidate_indices] = 1.0
+            thresholds = torch.rand(num_graphs, device=device)
+            candidate_indices = torch.arange(candidate_logits.numel(), device=device)
+            sentinel = candidate_logits.numel()
+            chosen_packed_indices = scatter(
+                torch.where(
+                    relative_cumulative_probs >= thresholds[candidate_batch],
+                    candidate_indices,
+                    candidate_indices.new_full(candidate_indices.shape, sentinel),
+                ),
+                candidate_batch,
+                dim=0,
+                dim_size=num_graphs,
+                reduce="min",
+            )
+            chosen_packed_indices = torch.where(
+                chosen_packed_indices == sentinel,
+                last_candidate_indices,
+                chosen_packed_indices,
+            )
+            action_indices = chosen_packed_indices - candidate_ptr[:-1]
+            log_normalizers = torch.log(sum_exp_logits) + max_logits
+            old_log_probs = candidate_logits[chosen_packed_indices] - log_normalizers
+            action_indices_cpu = action_indices.cpu().tolist()
+            old_log_probs_cpu = old_log_probs.cpu().tolist()
+
+            for rollout, action, old_log_prob in zip(chunk_rollouts, action_indices_cpu, old_log_probs_cpu):
+                if rollout.state is None:
+                    continue
+
+                rollout.steps.append(
+                    GRPOStep(
+                        state=rollout.state,
+                        action=action,
+                        old_log_prob=old_log_prob,
+                    )
+                )
+
+                rollout.solver.step(rollout.solver.candidates[action])
+                rollout.episode_steps += 1
+                rollout.terminal_state = rollout.solver.state
+
+                if rollout.solver.state in [10, 20]:
+                    rollout.reward = -float(rollout.solver.decisions)
+                    rollout.state = None
+                elif rollout.episode_steps >= cfg.max_decisions_train:
+                    rollout.reward = cfg.truncate_penalty
+                    rollout.state = None
+                elif rollout.solver.state == 0:
+                    rollout.state = build_vcg_from_solver(rollout.solver)
+                    next_active_rollouts.append(rollout)
+                else:
+                    raise ValueError(f"Unexpected solver state: {rollout.solver.state}")
 
         active_rollouts = next_active_rollouts
 
-    return [
+    episode_groups_result = [
         [
             GRPOEpisode(
                 steps=rollout.steps,
@@ -224,6 +262,7 @@ def collect_training_groups(
         ]
         for group_rollouts in episode_groups
     ]
+    return episode_groups_result
 
 
 def prepare_grpo_training_steps(

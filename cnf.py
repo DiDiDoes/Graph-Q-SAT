@@ -1,3 +1,5 @@
+from typing import Optional
+
 from pysat.formula import CNF
 import torch
 from torch_geometric.data import Data
@@ -42,14 +44,15 @@ class CNFLoader:
             edge_attr=torch.tensor(edge_attr, dtype=torch.float)
         )
 
-def build_vcg_from_solver(solver: MiniSAT, device: torch.device) -> Data:
+def build_vcg_from_solver(solver: MiniSAT, device: Optional[torch.device] = None) -> Data:
     x, edge_index, edge_attr = solver.get_vcg()
     graph = Data(
         x=torch.tensor(x, dtype=torch.float),
         edge_index=torch.tensor(edge_index, dtype=torch.long),
         edge_attr=torch.tensor(edge_attr, dtype=torch.float)
     )
-    graph.to(device)
+    if device is not None:
+        graph = graph.to(device)
     return graph
 
 if __name__ == "__main__":

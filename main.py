@@ -258,9 +258,10 @@ def train_grpo_model(
             ]
             random.shuffle(training_steps)
 
+            n_full = (len(training_steps) // cfg.step_batch_size) * cfg.step_batch_size
             step_batches = [
                 training_steps[start:start + cfg.step_batch_size]
-                for start in range(0, len(training_steps), cfg.step_batch_size)
+                for start in range(0, n_full, cfg.step_batch_size)
             ]
             if not step_batches:
                 step_batches = [[]]

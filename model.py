@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import List
+from typing import List, Tuple
 
 from torch_geometric.data import Data
 from torch_geometric.utils import scatter
@@ -252,17 +252,28 @@ class GraphQSat(nn.Module):
 
     @staticmethod
     def split_candidate_logits(data: Data, qs: torch.Tensor, var_mask: torch.Tensor) -> List[torch.Tensor]:
+        candidate_logits, candidate_ptr = GraphQSat.pack_candidate_logits(data, qs, var_mask)
+        candidate_counts = (candidate_ptr[1:] - candidate_ptr[:-1]).tolist()
+        return list(candidate_logits.split(candidate_counts))
+
+    @staticmethod
+    def pack_candidate_logits(data: Data, qs: torch.Tensor, var_mask: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        candidate_logits = qs[var_mask].flatten()
         batch = getattr(data, "batch", None)
         if batch is None:
-            return [qs[var_mask].flatten()]
+            candidate_ptr = torch.tensor(
+                [0, candidate_logits.numel()],
+                dtype=torch.long,
+                device=candidate_logits.device,
+            )
+            return candidate_logits, candidate_ptr
 
         num_graphs = int(batch.max().item()) + 1 if batch.numel() > 0 else 1
-        var_qs = qs[var_mask]
         var_batch = batch[var_mask]
-        return [
-            var_qs[var_batch == graph_idx].flatten()
-            for graph_idx in range(num_graphs)
-        ]
+        candidate_counts = torch.bincount(var_batch, minlength=num_graphs) * qs.size(-1)
+        candidate_ptr = torch.zeros(num_graphs + 1, dtype=torch.long, device=batch.device)
+        candidate_ptr[1:] = candidate_counts.cumsum(dim=0)
+        return candidate_logits, candidate_ptr
 
     @torch.no_grad()
     def select_action(self, data: Data):
@@ -273,7 +284,7 @@ class GraphQSat(nn.Module):
         The paper selects the argmax over all variable-node Q-values.
         """
         qs, var_mask = self.forward(data)
-        candidate_logits = self.split_candidate_logits(data, qs, var_mask)[0]
+        candidate_logits, _ = self.pack_candidate_logits(data, qs, var_mask)
         return candidate_logits.argmax(dim=-1).item()
 
 
