@@ -14,4 +14,4 @@ python main.py train \
   --dataset 50 \
   --sat true \
   --seed $SEED \
-  --checkpoint-path checkpoints/graphqsat_sat50_seed${SEED}.pth
+  --checkpoint-path checkpoints/graphqsat/sat50_seed${SEED}.pth

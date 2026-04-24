@@ -4,11 +4,16 @@
 #SBATCH --mem=32G
 #SBATCH --gpus=mi210:1
 #SBATCH -p batch
-#SBATCH --array=0-34
+#SBATCH --array=0-19
+#SBATCH -x c02
 #SBATCH --output=logs/graphqsat-train-mas-easy-sat-%A_%a.out
 #SBATCH --error=/scratch/%u/graphqsat-train-mas-easy-sat-%A_%a.err
 
 DATASETS=(
+  "3-sat/v5c24"
+  "3-sat/v10c49"
+  "3-sat/v15c71"
+  "3-sat/v20c92"
   "sr/easy"
   "3-sat/easy"
   "ca/easy"
@@ -36,4 +41,4 @@ python main.py train \
   --dataset "${DATASET}" \
   --sat true \
   --seed "${SEED}" \
-  --checkpoint-path "checkpoints/graphqsat_${DATASET_TAG}_seed${SEED}.pth"
+  --checkpoint-path "checkpoints/graphqsat/${DATASET_TAG}_seed${SEED}.pth"

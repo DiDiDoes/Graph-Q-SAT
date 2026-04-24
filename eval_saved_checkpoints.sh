@@ -1,13 +1,17 @@
 #!/bin/bash
 DATASETS=(
   "50"
-  "sr"
-  "3-sat"
-  "ca"
-  "ps"
-  "k-clique"
-  "k-domset"
-  "k-vercov"
+  "3-sat/v5c24"
+  "3-sat/v10c49"
+  "3-sat/v15c71"
+  "3-sat/v20c92"
+  "sr/easy"
+  "3-sat/easy"
+  "ca/easy"
+  "ps/easy"
+  "k-clique/easy"
+  "k-domset/easy"
+  "k-vercov/easy"
 )
 
 for DATASET in "${DATASETS[@]}"; do
@@ -15,12 +19,12 @@ for DATASET in "${DATASETS[@]}"; do
     DATASET_SPEC="50"
     CHECKPOINT_TAG="sat50"
   else
-    DATASET_SPEC="${DATASET}/easy"
-    CHECKPOINT_TAG="${DATASET}_easy"
+    DATASET_SPEC="${DATASET}"
+    CHECKPOINT_TAG="${DATASET//\//_}"
   fi
 
   for SEED in 0 1 2 3 4; do
-    CHECKPOINT_PATH="checkpoints/graphqsat_${CHECKPOINT_TAG}_seed${SEED}.pth"
+    CHECKPOINT_PATH="checkpoints/graphqsat/${CHECKPOINT_TAG}_seed${SEED}.pth"
 
     if [[ ! -f "${CHECKPOINT_PATH}" ]]; then
       echo "Missing checkpoint: ${CHECKPOINT_PATH}" >&2
